@@ -49,11 +49,10 @@ class RxLensDDIEngine:
         self.core = core_engine
 
     def normalize_name(self, text: str) -> str:
-        return re.sub(
-            r"\s+",
-            " ",
-            re.sub(r"[^a-zA-Z0-9\s+-]", " ", (text or "").lower()),
-        ).strip()
+        cleaned = re.sub(r"[^a-zA-Z0-9\s+-]", " ", (text or "").lower())
+        cleaned = re.sub(r"\b\d+(?:\.\d+)?\s*(?:mg|ml|mcg|gm|g|iu|%)\b", " ", cleaned)
+        cleaned = re.sub(r"\b(?:mg|ml|mcg|gm|g|iu)\b", " ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip()
 
     def extract_candidates_from_text(self, prescription_text: str) -> list[str]:
         if not prescription_text or not prescription_text.strip():
@@ -92,62 +91,33 @@ class RxLensDDIEngine:
         if self.core is None:
             return info
 
-        for method_name in (
-            "find_medicine",
-            "search_medicine",
-            "lookup_medicine",
-            "get_medicine",
-            "match_medicine",
-        ):
-            fn = getattr(self.core, method_name, None)
-            if callable(fn):
-                try:
-                    res = fn(query)
-                    if res:
-                        info["matched"] = True
-                        info["raw"] = res
-                        if isinstance(res, dict):
-                            info["brand"] = (
-                                res.get("brand")
-                                or res.get("brand_name")
-                                or res.get("medicine")
-                                or res.get("name")
-                                or info["brand"]
-                            )
-                            info["generic"] = self.normalize_name(
-                                str(
-                                    res.get("generic")
-                                    or res.get("generic_name")
-                                    or info["generic"]
-                                )
-                            )
-                        return info
-                except Exception:
-                    pass
-
         med_df = getattr(self.core, "med_df", None)
-        if med_df is not None and hasattr(med_df, "empty") and not med_df.empty:
-            cols = [str(c) for c in med_df.columns]
-            name_col = next(
-                (c for c in cols if any(k in c.lower() for k in ("brand", "medicine", "name", "drug"))),
-                cols[0],
-            )
-            gen_col = next(
-                (c for c in cols if "generic" in c.lower() or "salt" in c.lower() or "composition" in c.lower()),
-                None,
-            )
-            series_str = med_df[name_col].astype(str).str.lower()
-            matched_rows = med_df[series_str == q_norm]
-            if matched_rows.empty:
-                matched_rows = med_df[series_str.str.contains(re.escape(q_norm), na=False)]
+        if med_df is not None and hasattr(med_df, "empty") and not med_df.empty and q_norm:
+            brand_col = "brand name" if "brand name" in med_df.columns else None
+            brand_norm_col = "brand name_norm" if "brand name_norm" in med_df.columns else None
+            gen_norm_col = "generic_norm" if "generic_norm" in med_df.columns else None
+            gen_col = "generic" if "generic" in med_df.columns else None
+
+            matched_rows = med_df.iloc[0:0]
+            if brand_norm_col:
+                matched_rows = med_df[med_df[brand_norm_col].astype(str).str.lower() == q_norm]
+            if matched_rows.empty and brand_col:
+                matched_rows = med_df[med_df[brand_col].astype(str).str.lower() == q_norm]
+            if matched_rows.empty and gen_norm_col:
+                matched_rows = med_df[med_df[gen_norm_col].astype(str).str.lower().str.contains(re.escape(q_norm), na=False)]
+            if matched_rows.empty and brand_col:
+                matched_rows = med_df[med_df[brand_col].astype(str).str.lower().str.contains(re.escape(q_norm), na=False)]
 
             if not matched_rows.empty:
                 row = matched_rows.iloc[0].to_dict()
                 info["matched"] = True
                 info["raw"] = row
-                info["brand"] = str(row.get(name_col, query.strip()))
-                if gen_col and row.get(gen_col):
-                    info["generic"] = self.normalize_name(str(row.get(gen_col)))
+                if brand_col and row.get(brand_col):
+                    info["brand"] = str(row[brand_col])
+                if gen_norm_col and row.get(gen_norm_col):
+                    info["generic"] = self.normalize_name(str(row[gen_norm_col]))
+                elif gen_col and row.get(gen_col):
+                    info["generic"] = self.normalize_name(str(row[gen_col]))
                 return info
 
         return info
@@ -209,4 +179,68 @@ class RxLensDDIEngine:
                     for rule_pair, rule in self.KNOWN_DDI_PAIRS.items():
                         items_list = list(rule_pair)
                         if len(items_list) == 2:
-                            a, b = items_list[0], items_list
+                            a, b = items_list[0], items_list[1]
+                            if (a in g1 and b in g2) or (a in g2 and b in g1):
+                                ddi_alerts.append(
+                                    {
+                                        "pair": f"{g1} + {g2}",
+                                        "severity": rule["severity"],
+                                        "effect": rule["effect"],
+                                        "recommendation": rule["recommendation"],
+                                    }
+                                )
+                                break
+
+        clean_allergies = [
+            self.normalize_name(a) for a in (allergies or []) if a and a.strip()
+        ]
+        allergy_alerts: list[dict[str, str]] = []
+        for med in med_items:
+            med_blob = f"{med.get('brand', '')} {med.get('generic', '')}".lower()
+            for allergy in clean_allergies:
+                if allergy and allergy in med_blob:
+                    allergy_alerts.append(
+                        {
+                            "medicine": med.get("brand", ""),
+                            "generic": med.get("generic", ""),
+                            "allergy": allergy,
+                            "severity": "High",
+                            "message": f"Potential allergy match with '{allergy}'.",
+                        }
+                    )
+
+        clean_conditions = [
+            self.normalize_name(c) for c in (conditions or []) if c and c.strip()
+        ]
+        condition_warnings: list[dict[str, str]] = []
+        for cond in clean_conditions:
+            if any(k in cond for k in ("kidney", "renal", "ckd")):
+                for g in norm_generics:
+                    if any(d in g for d in ("ibuprofen", "nsaid", "diclofenac", "ketorolac", "metformin")):
+                        condition_warnings.append(
+                            {
+                                "condition": cond,
+                                "generic": g,
+                                "severity": "Moderate-High",
+                                "message": f"Use caution with '{g}' in renal/kidney conditions.",
+                            }
+                        )
+            if any(k in cond for k in ("liver", "hepatic")):
+                for g in norm_generics:
+                    if any(d in g for d in ("paracetamol", "acetaminophen", "atorvastatin", "simvastatin")):
+                        condition_warnings.append(
+                            {
+                                "condition": cond,
+                                "generic": g,
+                                "severity": "Moderate-High",
+                                "message": f"Monitor hepatic safety when using '{g}' with liver conditions.",
+                            }
+                        )
+
+        return {
+            "consolidated_medications": med_items,
+            "ddi_alerts": ddi_alerts,
+            "allergy_alerts": allergy_alerts,
+            "condition_warnings": condition_warnings,
+            "has_risk": bool(ddi_alerts or allergy_alerts or condition_warnings),
+        }
